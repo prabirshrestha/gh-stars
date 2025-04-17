@@ -2,11 +2,11 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use dirs::cache_dir;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use gh_token;
 use indicatif::{ProgressBar, ProgressStyle}; // Added for spinners
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, LINK, USER_AGENT};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::fs::{File, create_dir_all};
 use std::io::BufReader;
 use std::path::PathBuf;
@@ -144,8 +144,11 @@ fn get_github_token(cli_token: &Option<String>) -> Option<String> {
         return Some(token.clone());
     }
 
-    // Otherwise check environment variable
-    env::var("GITHUB_TOKEN").ok()
+    // Otherwise try to get token from gh_token crate
+    match gh_token::get() {
+        Ok(token) => Some(token),
+        Err(_) => None,
+    }
 }
 
 async fn fetch_stars(username: &str, force: bool, token: &Option<String>) -> Result<Cache> {

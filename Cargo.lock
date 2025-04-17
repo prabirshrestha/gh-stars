@@ -799,6 +799,7 @@ dependencies = [
  "clap",
  "dirs 6.0.0",
  "fastembed",
+ "gh-token",
  "indicatif",
  "reqwest",
  "rusqlite",
@@ -806,6 +807,18 @@ dependencies = [
  "serde_json",
  "sqlite-vec",
  "tokio",
+]
+
+[[package]]
+name = "gh-token"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b05178455aca6d0624534729a2f8d2b94c93b02c0fcdf1736453912b9a9b4f"
+dependencies = [
+ "home",
+ "serde",
+ "serde_derive",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -895,6 +908,15 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.12",
  "ureq",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "home"
+version = "0.5.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "589533453244b0995c858700322199b2becb13b627df2851f64a2775d024abcf"
+dependencies = [
  "windows-sys 0.59.0",
 ]
 
@@ -2282,6 +2304,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2770,6 +2805,12 @@ name = "unicode_categories"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39ec24b3121d976906ece63c9daad25b85969647682eee313cb5779fdd69e14e"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
