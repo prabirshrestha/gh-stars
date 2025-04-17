@@ -3,14 +3,15 @@ use clap::{Parser, Subcommand};
 use dirs::cache_dir;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use gh_token;
-use indicatif::{ProgressBar, ProgressStyle}; // Added for spinners
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, LINK, USER_AGENT};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, ffi::sqlite3_auto_extension, params};
 use serde::{Deserialize, Serialize};
-use std::fs::{File, create_dir_all};
-use std::io::BufReader;
+use sqlite_vec::sqlite3_vec_init;
+use std::fs::create_dir_all;
 use std::path::PathBuf;
 use std::time::SystemTime;
+use zerocopy::AsBytes;
 
 #[derive(Parser)]
 #[command(
@@ -51,14 +52,18 @@ enum Commands {
         #[arg(default_value = "")]
         query: String,
 
-        /// Use semantic vector search instead of keyword search
-        #[arg(long)]
-        semantic: bool,
+        /// Maximum number of results to return
+        #[arg(short, long, default_value = "30")]
+        limit: usize,
     },
     /// List all cached stars for a user
     List {
         /// GitHub username
         username: String,
+
+        /// Maximum number of results to return
+        #[arg(short, long, default_value = "30")]
+        limit: usize,
     },
     /// Show detailed information about a specific repository
     Info {
@@ -92,42 +97,60 @@ struct StarredRepo {
     created_at: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Cache {
-    username: String,
-    timestamp: u64,
-    repos: Vec<StarredRepo>,
+// Get the path to the SQLite database (one DB for all users)
+fn get_db_path() -> Result<PathBuf> {
+    let mut db_path = cache_dir().ok_or_else(|| anyhow!("Failed to determine cache directory"))?;
+    db_path.push("gh-stars");
+    create_dir_all(&db_path)?;
+    db_path.push("stars.db");
+    Ok(db_path)
 }
 
-fn get_cache_path(username: &str) -> Result<PathBuf> {
-    let mut cache_path =
-        cache_dir().ok_or_else(|| anyhow!("Failed to determine cache directory"))?;
-    cache_path.push("gh-stars");
-    create_dir_all(&cache_path)?;
-    cache_path.push(format!("{}.json", username));
-    Ok(cache_path)
-}
+// Initialize SQLite database with vector extension
+fn init_db() -> Result<Connection> {
+    let db_path = get_db_path()?;
+    let conn = Connection::open(&db_path)?;
 
-fn load_cache(username: &str) -> Result<Option<Cache>> {
-    let cache_path = get_cache_path(username)?;
+    // Create tables if they don't exist
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            last_updated INTEGER NOT NULL
+        )",
+        [],
+    )?;
 
-    if !cache_path.exists() {
-        return Ok(None);
-    }
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS repos (
+            id INTEGER,
+            username TEXT NOT NULL,
+            full_name TEXT NOT NULL,
+            name TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            html_url TEXT NOT NULL,
+            description TEXT,
+            language TEXT,
+            stars INTEGER NOT NULL,
+            forks INTEGER,
+            open_issues INTEGER,
+            updated_at TEXT NOT NULL,
+            created_at TEXT,
+            json TEXT NOT NULL,
+            PRIMARY KEY (id, username),
+            FOREIGN KEY (username) REFERENCES users(username)
+        )",
+        [],
+    )?;
 
-    let file = File::open(cache_path)?;
-    let reader = BufReader::new(file);
-    let cache: Cache = serde_json::from_reader(reader).context("Failed to parse cache file")?;
+    // Updated to use vec0 virtual table
+    conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS repo_vectors USING vec0(
+            embedding float[384]
+        )",
+        [],
+    )?;
 
-    Ok(Some(cache))
-}
-
-fn save_cache(cache: &Cache) -> Result<()> {
-    let cache_path = get_cache_path(&cache.username)?;
-    let file = File::create(cache_path)?;
-    serde_json::to_writer_pretty(file, cache).context("Failed to write cache file")?;
-
-    Ok(())
+    Ok(conn)
 }
 
 fn has_next_page(headers: &HeaderMap) -> bool {
@@ -151,18 +174,57 @@ fn get_github_token(cli_token: &Option<String>) -> Option<String> {
     }
 }
 
-async fn fetch_stars(username: &str, force: bool, token: &Option<String>) -> Result<Cache> {
-    // Check cache first unless forced refresh
+async fn fetch_stars(
+    username: &str,
+    force: bool,
+    token: &Option<String>,
+) -> Result<Vec<StarredRepo>> {
+    // Open database connection
+    let conn = init_db()?;
+
+    // Check if we need to refresh the data
     if !force {
-        if let Some(cache) = load_cache(username)? {
-            // Check if cache is fresh (less than 1 day old)
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)?
-                .as_secs();
-            if now - cache.timestamp < 86400 {
-                println!("Using cached data (less than 1 day old)");
-                return Ok(cache);
+        let refresh_needed = match conn.query_row(
+            "SELECT last_updated FROM users WHERE username = ?",
+            params![username],
+            |row| {
+                let last_updated: i64 = row.get(0)?;
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                Ok(now - last_updated > 86400) // Refresh if older than 1 day
+            },
+        ) {
+            Ok(need_refresh) => need_refresh,
+            Err(rusqlite::Error::QueryReturnedNoRows) => true, // No data, need to fetch
+            Err(e) => return Err(e.into()),
+        };
+
+        if !refresh_needed {
+            println!("Using cached data (less than 1 day old)");
+
+            // Fetch cached repos from database
+            let mut stmt = conn.prepare("SELECT json FROM repos WHERE username = ?")?;
+
+            let repos_iter = stmt.query_map(params![username], |row| {
+                let json: String = row.get(0)?;
+                let repo: StarredRepo = serde_json::from_str(&json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                Ok(repo)
+            })?;
+
+            let mut repos = Vec::new();
+            for repo in repos_iter {
+                repos.push(repo?);
             }
+
+            return Ok(repos);
         }
     }
 
@@ -245,21 +307,12 @@ async fn fetch_stars(username: &str, force: bool, token: &Option<String>) -> Res
 
     spinner.finish_with_message(format!("Fetched {} starred repositories", all_repos.len()));
 
+    // Save to database
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_secs();
 
-    let cache = Cache {
-        username: username.to_string(),
-        timestamp: now,
-        repos: all_repos,
-    };
-
-    // Save to JSON cache
-    save_cache(&cache)?;
-    println!("Saved cache to {}", get_cache_path(username)?.display());
-
-    // Also save to SQLite with embeddings for vector search
+    // Update the database
     let db_spinner = ProgressBar::new_spinner();
     db_spinner.set_style(
         ProgressStyle::default_spinner()
@@ -267,17 +320,14 @@ async fn fetch_stars(username: &str, force: bool, token: &Option<String>) -> Res
             .template("{spinner} {msg}")
             .unwrap(),
     );
-    db_spinner.enable_steady_tick(std::time::Duration::from_millis(100)); // Keep spinner moving
-    db_spinner.set_message("Generating embeddings and storing in SQLite database...");
+    db_spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+    db_spinner.set_message("Storing repos and generating embeddings in database...");
 
-    store_repos_in_db(username, &cache.repos)?;
+    store_repos_in_db(username, &all_repos, now as i64)?;
 
-    db_spinner.finish_with_message(format!(
-        "Database prepared for vector search at {}",
-        get_db_path(username)?.display()
-    ));
+    db_spinner.finish_with_message(format!("Database updated for user {}", username));
 
-    Ok(cache)
+    Ok(all_repos)
 }
 
 // Helper function to parse comma-separated languages
@@ -288,101 +338,8 @@ fn parse_languages(s: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-// Get the path to the SQLite database
-fn get_db_path(username: &str) -> Result<PathBuf> {
-    let mut db_path = cache_dir().ok_or_else(|| anyhow!("Failed to determine cache directory"))?;
-    db_path.push("gh-stars");
-    create_dir_all(&db_path)?;
-    db_path.push(format!("{}.db", username));
-    Ok(db_path)
-}
-
-// Check if SQLite database exists and create if needed
-fn ensure_db_exists(username: &str) -> Result<()> {
-    let db_path = get_db_path(username)?;
-
-    // If DB doesn't exist but cache does, create the DB
-    if !db_path.exists() {
-        if let Some(cache) = load_cache(username)? {
-            println!("Database not found but cache exists. Creating database from cache...");
-            let spinner = ProgressBar::new_spinner();
-            spinner.set_style(
-                ProgressStyle::default_spinner()
-                    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-                    .template("{spinner} {msg}")
-                    .unwrap(),
-            );
-            spinner.enable_steady_tick(std::time::Duration::from_millis(100)); // Keep spinner moving
-            spinner.set_message("Generating embeddings and storing in SQLite database...");
-
-            store_repos_in_db(username, &cache.repos)?;
-
-            spinner.finish_with_message("Database created successfully");
-            return Ok(());
-        }
-    }
-
-    Ok(())
-}
-
-// Initialize SQLite database with vector extension
-fn init_db(username: &str) -> Result<Connection> {
-    let db_path = get_db_path(username)?;
-    let conn = Connection::open(&db_path)?;
-
-    // Note: To use vector search functionality, you need to:
-    // 1. Install sqlite-vec from https://github.com/asg017/sqlite-vec
-    // 2. Build rusqlite with the loadable_extension feature
-    // 3. Uncomment and modify the code below to load the extension
-
-    // Uncomment when you have sqlite-vec installed and rusqlite with loadable_extension:
-    /*
-    #[cfg(target_os = "linux")]
-    conn.load_extension("libsqlite_vec", None)
-        .map_err(|e| anyhow!("Failed to load sqlite-vec extension: {}", e))?;
-
-    #[cfg(target_os = "macos")]
-    conn.load_extension("libsqlite_vec", None)
-        .map_err(|e| anyhow!("Failed to load sqlite-vec extension: {}", e))?;
-
-    #[cfg(target_os = "windows")]
-    conn.load_extension("sqlite_vec", None)
-        .map_err(|e| anyhow!("Failed to load sqlite-vec extension: {}", e))?;
-    */
-
-    // Create tables if they don't exist
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS repos (
-            id INTEGER PRIMARY KEY,
-            full_name TEXT NOT NULL,
-            name TEXT NOT NULL,
-            owner TEXT NOT NULL,
-            html_url TEXT NOT NULL,
-            description TEXT,
-            language TEXT,
-            stars INTEGER NOT NULL,
-            forks INTEGER,
-            open_issues INTEGER,
-            updated_at TEXT NOT NULL,
-            created_at TEXT,
-            json TEXT NOT NULL
-        )",
-        [],
-    )?;
-
-    conn.execute(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS repo_vectors USING vec(
-            id INTEGER,
-            embedding BLOB,
-        )",
-        [],
-    )?;
-
-    Ok(conn)
-}
-
-// Store repositories in SQLite database with embeddings
-fn store_repos_in_db(username: &str, repos: &[StarredRepo]) -> Result<()> {
+// Store repositories and their embeddings in the database
+fn store_repos_in_db(username: &str, repos: &[StarredRepo], timestamp: i64) -> Result<()> {
     // Create a progress bar for the embedding process
     let progress = ProgressBar::new(repos.len() as u64);
     progress.set_style(
@@ -393,20 +350,42 @@ fn store_repos_in_db(username: &str, repos: &[StarredRepo]) -> Result<()> {
     );
     progress.set_message("Processing repositories");
 
-    let mut conn = init_db(username)?;
+    let mut conn = init_db()?;
 
-    // Clear existing data
-    conn.execute("DELETE FROM repos", [])?;
-    conn.execute("DELETE FROM repo_vectors", [])?;
+    // Begin transaction
+    let tx = conn.transaction()?;
 
-    // Initialize the embedder using the new API
+    // Update or insert user
+    tx.execute(
+        "INSERT OR REPLACE INTO users (username, last_updated) VALUES (?, ?)",
+        params![username, timestamp],
+    )?;
+
+    // Clear existing data for this user
+    tx.execute("DELETE FROM repos WHERE username = ?", params![username])?;
+
+    // Clear existing vectors for this user's repos
+    {
+        // Create a scope to ensure stmt is dropped before tx.commit()
+        // First, get all repo IDs for this user
+        let mut stmt = tx.prepare("SELECT id FROM repos WHERE username = ?")?;
+        let repo_ids: Vec<i64> = stmt
+            .query_map(params![username], |row| row.get(0))?
+            .collect::<Result<Vec<i64>, _>>()?;
+
+        if !repo_ids.is_empty() {
+            // For each ID, delete the corresponding vector
+            for id in repo_ids {
+                tx.execute("DELETE FROM repo_vectors WHERE rowid = ?", params![id])?;
+            }
+        }
+    } // stmt is dropped here
+
+    // Initialize the embedder
     let embedder = TextEmbedding::try_new(
         InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true),
     )
     .map_err(|e| anyhow!("Failed to initialize embedder: {}", e))?;
-
-    // Begin transaction
-    let tx = conn.transaction()?;
 
     for (i, repo) in repos.iter().enumerate() {
         // Update progress bar
@@ -415,26 +394,14 @@ fn store_repos_in_db(username: &str, repos: &[StarredRepo]) -> Result<()> {
             progress.set_message(format!("Processed {}/{} repositories", i + 1, repos.len()));
         }
 
-        // Create text for embedding (combine name and description)
-        let embed_text = format!(
-            "{} {} {}",
-            repo.name,
-            repo.language.as_deref().unwrap_or(""),
-            repo.description.as_deref().unwrap_or("")
-        );
-
-        // Generate embedding with the new API
-        let embedding = embedder
-            .embed(vec![embed_text], None)
-            .map_err(|e| anyhow!("Embedding failed: {}", e))?;
-
         // Insert repo data
         tx.execute(
             "INSERT INTO repos
-            (id, full_name, name, owner, html_url, description, language, stars, forks, open_issues, updated_at, created_at, json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (id, username, full_name, name, owner, html_url, description, language, stars, forks, open_issues, updated_at, created_at, json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 repo.id,
+                username,
                 repo.full_name,
                 repo.name,
                 repo.owner.login,
@@ -450,162 +417,268 @@ fn store_repos_in_db(username: &str, repos: &[StarredRepo]) -> Result<()> {
             ],
         )?;
 
-        // Insert embedding - convert f32 array to bytes
-        let embedding_bytes: Vec<u8> = embedding[0]
-            .iter()
-            .flat_map(|&f| f.to_ne_bytes().to_vec())
-            .collect();
+        // Create text for embedding (combine name and description)
+        let embed_text = format!(
+            "{} {} {}",
+            repo.name,
+            repo.language.as_deref().unwrap_or(""),
+            repo.description.as_deref().unwrap_or("")
+        );
 
+        // Generate embedding
+        let embedding = embedder
+            .embed(vec![embed_text], None)
+            .map_err(|e| anyhow!("Embedding failed: {}", e))?;
+
+        // Insert embedding
+        let embedding_bytes = embedding[0].as_bytes();
         tx.execute(
-            "INSERT INTO repo_vectors (id, embedding) VALUES (?, ?)",
+            "INSERT INTO repo_vectors(rowid, embedding) VALUES (?, ?)",
             params![repo.id, embedding_bytes],
         )?;
     }
 
     tx.commit()?;
+    progress.finish_with_message("Repositories stored in database");
+
     Ok(())
 }
 
-// Search repositories with traditional keyword search - Fixed with lifetime specifier
-fn search_repos<'a>(
-    cache: &'a Cache,
-    languages: &Option<Vec<String>>,
-    query: &str,
-) -> Vec<&'a StarredRepo> {
-    let query_lower = query.to_lowercase();
-
-    cache
-        .repos
-        .iter()
-        .filter(|repo| {
-            // Language filter
-            let language_match = match languages {
-                Some(langs) if !langs.is_empty() => repo
-                    .language
-                    .as_ref()
-                    .map(|rl| {
-                        let rl_lower = rl.to_lowercase();
-                        langs.iter().any(|l| rl_lower == l.to_lowercase())
-                    })
-                    .unwrap_or(false),
-                _ => true,
-            };
-
-            // Text search (if query is not empty)
-            let text_match = if query.is_empty() {
-                true
-            } else {
-                // Search in name
-                let name_match = repo.name.to_lowercase().contains(&query_lower);
-
-                // Search in description
-                let desc_match = repo
-                    .description
-                    .as_ref()
-                    .map(|d| d.to_lowercase().contains(&query_lower))
-                    .unwrap_or(false);
-
-                // Search in full name
-                let full_name_match = repo.full_name.to_lowercase().contains(&query_lower);
-
-                name_match || desc_match || full_name_match
-            };
-
-            language_match && text_match
-        })
-        .collect()
-}
-
-// Search repositories with semantic vector search
-fn search_repos_semantic(
+// Combined search function that uses both semantic and keyword search
+fn search_repos(
     username: &str,
     languages: &Option<Vec<String>>,
     query: &str,
+    limit: usize,
 ) -> Result<Vec<StarredRepo>> {
+    let conn = init_db()?;
+
+    // If query is empty, just list repos with language filter
     if query.is_empty() {
-        return Ok(Vec::new());
+        let mut sql = "SELECT json FROM repos WHERE username = ?".to_string();
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&username as &dyn rusqlite::ToSql];
+
+        // Add language filter if needed
+        if let Some(langs) = languages {
+            if !langs.is_empty() {
+                let placeholders: Vec<String> = (0..langs.len()).map(|_| "?".to_string()).collect();
+                sql.push_str(&format!(" AND language IN ({})", placeholders.join(",")));
+
+                for lang in langs {
+                    params.push(lang as &dyn rusqlite::ToSql);
+                }
+            }
+        }
+
+        sql.push_str(&format!(" ORDER BY stars DESC LIMIT {}", limit));
+
+        let mut stmt = conn.prepare(&sql)?;
+
+        let repos_iter = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let json: String = row.get(0)?;
+            let repo: StarredRepo = serde_json::from_str(&json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            Ok(repo)
+        })?;
+
+        let mut repos = Vec::new();
+        for repo in repos_iter {
+            repos.push(repo?);
+        }
+
+        return Ok(repos);
     }
-
-    // Ensure database exists
-    ensure_db_exists(username)?;
-
-    let conn = init_db(username)?;
-
-    // Initialize the embedder using the new API
-    let embedder = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::AllMiniLML6V2))
-        .map_err(|e| anyhow!("Failed to initialize embedder: {}", e))?;
-
-    // Generate embedding for the query with the new API
-    let query_embedding = embedder
-        .embed(vec![query.to_string()], None)
-        .map_err(|e| anyhow!("Embedding query failed: {}", e))?;
 
     // Prepare language filter if needed
     let language_filter = match languages {
         Some(langs) if !langs.is_empty() => {
-            let placeholders: Vec<String> =
-                (0..langs.len()).map(|i| format!("?{}", i + 3)).collect();
-            format!(" AND language IN ({})", placeholders.join(","))
+            let placeholders: Vec<String> = (0..langs.len()).map(|_| "?".to_string()).collect();
+            format!(" AND r.language IN ({})", placeholders.join(","))
         }
         _ => String::new(),
     };
 
-    // Build query
-    let sql = format!(
-        "SELECT r.* FROM repos r
-        JOIN (
-            SELECT id, vec_cosine_similarity(embedding, ?) AS similarity
-            FROM repo_vectors
-            ORDER BY similarity DESC
-            LIMIT 20
-        ) v ON r.id = v.id
-        WHERE v.similarity > ?{}
-        ORDER BY v.similarity DESC",
-        language_filter
+    // Format query for LIKE operations
+    let query_lower = format!("%{}%", query.to_lowercase());
+
+    // 1. Keyword search
+    let keyword_sql = format!(
+        "SELECT r.*, 1 AS search_type,
+        (CASE
+            WHEN LOWER(r.name) LIKE ? THEN 3
+            WHEN LOWER(r.full_name) LIKE ? THEN 2
+            WHEN LOWER(r.description) LIKE ? THEN 1
+            ELSE 0
+        END) AS score
+        FROM repos r
+        WHERE r.username = ?{}
+        AND (LOWER(r.name) LIKE ? OR LOWER(r.full_name) LIKE ? OR LOWER(r.description) LIKE ?)
+        ORDER BY score DESC, r.stars DESC
+        LIMIT {}",
+        language_filter, limit
     );
 
-    // Prepare statement
-    let mut stmt = conn.prepare(&sql)?;
+    // Build parameters for query without cloning
+    let mut keyword_params: Vec<&dyn rusqlite::ToSql> = Vec::new();
 
-    // Bind parameters - convert f32 embedding to bytes
-    let query_embedding_bytes: Vec<u8> = query_embedding[0]
-        .iter()
-        .flat_map(|&f| f.to_ne_bytes().to_vec())
-        .collect();
+    // Add the LIKE parameters
+    keyword_params.push(&query_lower as &dyn rusqlite::ToSql);
+    keyword_params.push(&query_lower as &dyn rusqlite::ToSql);
+    keyword_params.push(&query_lower as &dyn rusqlite::ToSql);
 
-    stmt.raw_bind_parameter(1, rusqlite::types::Value::Blob(query_embedding_bytes))?;
-    stmt.raw_bind_parameter(2, rusqlite::types::Value::Real(0.5))?; // Similarity threshold
+    // Add username
+    keyword_params.push(&username as &dyn rusqlite::ToSql);
 
-    // Bind language parameters if needed
+    // Add language parameters
     if let Some(langs) = languages {
-        if !langs.is_empty() {
-            for (i, lang) in langs.iter().enumerate() {
-                stmt.raw_bind_parameter(
-                    (i + 3) as usize,
-                    rusqlite::types::Value::Text(lang.clone()),
-                )?;
+        for lang in langs {
+            keyword_params.push(lang as &dyn rusqlite::ToSql);
+        }
+    }
+
+    // Add the trailing LIKE params for the OR conditions
+    keyword_params.push(&query_lower as &dyn rusqlite::ToSql);
+    keyword_params.push(&query_lower as &dyn rusqlite::ToSql);
+    keyword_params.push(&query_lower as &dyn rusqlite::ToSql);
+
+    // Execute keyword search
+    let mut keyword_stmt = conn.prepare(&keyword_sql)?;
+
+    let mut results = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+
+    // Add keyword search results
+    let keyword_rows =
+        keyword_stmt.query_map(rusqlite::params_from_iter(keyword_params.iter()), |row| {
+            let json: String = row.get("json")?;
+            let score: i32 = row.get("score")?;
+            let repo: StarredRepo = serde_json::from_str(&json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            Ok((repo, 0, score)) // 0 = keyword search
+        })?;
+
+    for row_result in keyword_rows {
+        let (repo, search_type, score) = row_result?;
+        if !seen_ids.contains(&repo.id) {
+            seen_ids.insert(repo.id);
+            results.push((repo, search_type, score));
+        }
+    }
+
+    // 2. Vector search if query isn't too short
+    if query.len() >= 3 {
+        // Initialize the embedder
+        let embedder = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::AllMiniLML6V2))
+            .map_err(|e| anyhow!("Failed to initialize embedder: {}", e))?;
+
+        // Generate embedding for the query
+        let query_embedding = embedder
+            .embed(vec![query.to_string()], None)
+            .map_err(|e| anyhow!("Embedding query failed: {}", e))?;
+
+        // Convert the embedding to bytes
+        let query_embedding_bytes = query_embedding[0].as_bytes().to_vec();
+
+        // Build the vector search query
+        let vector_sql = format!(
+            "SELECT r.*, 2 AS search_type, v.distance AS score
+            FROM repos r
+            JOIN (
+                SELECT rowid, distance
+                FROM repo_vectors
+                WHERE embedding MATCH ?
+                ORDER BY distance
+                LIMIT {}
+            ) v ON r.id = v.rowid
+            WHERE r.username = ?{}
+            ORDER BY v.distance ASC",
+            limit, language_filter
+        );
+
+        // Build vector search parameters without cloning
+        let mut vector_params: Vec<&dyn rusqlite::ToSql> = Vec::new();
+
+        // Add embedding parameter
+        vector_params.push(&query_embedding_bytes as &dyn rusqlite::ToSql);
+
+        // Add username
+        vector_params.push(&username as &dyn rusqlite::ToSql);
+
+        // Add language parameters
+        if let Some(langs) = languages {
+            for lang in langs {
+                vector_params.push(lang as &dyn rusqlite::ToSql);
+            }
+        }
+
+        // Execute vector search
+        let mut vector_stmt = conn.prepare(&vector_sql)?;
+
+        let vector_rows =
+            vector_stmt.query_map(rusqlite::params_from_iter(vector_params.iter()), |row| {
+                let json: String = row.get("json")?;
+                let score: f64 = row.get("score")?;
+                let repo: StarredRepo = serde_json::from_str(&json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                // Convert distance score to an integer for ranking
+                let int_score = ((1.0 - score) * 100.0) as i32;
+                Ok((repo, 1, int_score)) // 1 = vector search
+            })?;
+
+        // Add vector search results
+        for row_result in vector_rows {
+            let (repo, search_type, score) = row_result?;
+            if !seen_ids.contains(&repo.id) {
+                seen_ids.insert(repo.id);
+                results.push((repo, search_type, score));
             }
         }
     }
 
-    // Execute query and collect results
-    let mut results: Vec<StarredRepo> = Vec::new();
-    let rows = stmt.query_map([], |row| {
-        let json: String = row.get("json")?;
-        let repo: StarredRepo = serde_json::from_str(&json).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
-        })?;
-        Ok(repo)
-    })?;
+    // Sort by score descending
+    results.sort_by(|a, b| {
+        // First compare by search type (keyword first, then vector)
+        let type_compare = a.1.cmp(&b.1);
+        if type_compare != std::cmp::Ordering::Equal {
+            return type_compare;
+        }
 
-    for row in rows {
-        results.push(row.map_err(|e| anyhow!("Error processing row: {}", e))?);
-    }
+        // Then by score
+        let score_compare = b.2.cmp(&a.2);
+        if score_compare != std::cmp::Ordering::Equal {
+            return score_compare;
+        }
+
+        // Finally by stars
+        b.0.stargazers_count.cmp(&a.0.stargazers_count)
+    });
+
+    // Limit results to the requested amount
+    let results = results
+        .into_iter()
+        .take(limit)
+        .map(|(repo, _, _)| repo)
+        .collect();
 
     Ok(results)
 }
 
-fn display_repos(repos: &[&StarredRepo]) {
+fn display_repos(repos: &[StarredRepo]) {
     if repos.is_empty() {
         println!("No repositories found.");
         return;
@@ -613,14 +686,14 @@ fn display_repos(repos: &[&StarredRepo]) {
 
     println!("Found {} repositories:", repos.len());
     println!(
-        "{:<4} {:<40} {:<15} {:<8}",
+        "{:<4} {:<60} {:<15} {:<8}",
         "No.", "Repository", "Language", "Stars"
     );
-    println!("{}", "-".repeat(80));
+    println!("{}", "-".repeat(100));
 
     for (i, repo) in repos.iter().enumerate() {
         println!(
-            "{:<4} {:<40} {:<15} {:<8}",
+            "{:<4} {:<60} {:<15} {:<8}",
             i + 1,
             repo.full_name,
             repo.language.as_deref().unwrap_or("N/A"),
@@ -661,9 +734,7 @@ fn display_repo_info(repo: &StarredRepo) {
 #[tokio::main]
 async fn main() -> Result<()> {
     unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
+        sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
     }
 
     let cli = Cli::parse();
@@ -680,76 +751,39 @@ async fn main() -> Result<()> {
             username,
             language,
             query,
-            semantic,
+            limit,
         } => {
-            // Ensure database exists for semantic search
-            if *semantic {
-                ensure_db_exists(username)?;
+            println!(
+                "Searching repositories for user: {} (limit: {})",
+                username, limit
+            );
 
-                println!("Performing semantic vector search for: {}", query);
-
-                // Check if SQLite database exists
-                let db_path = get_db_path(username)?;
-                if !db_path.exists() {
-                    return Err(anyhow!(
-                        "Vector database not found for user: {}. Run 'fetch' first.",
-                        username
-                    ));
-                }
-
-                let results = search_repos_semantic(username, language, query)?;
-
-                if results.is_empty() {
-                    println!("No repositories found matching your query.");
-                } else {
-                    println!("Found {} repositories with semantic search:", results.len());
-                    println!(
-                        "{:<4} {:<40} {:<15} {:<8}",
-                        "No.", "Repository", "Language", "Stars"
-                    );
-                    println!("{}", "-".repeat(80));
-
-                    for (i, repo) in results.iter().enumerate() {
-                        println!(
-                            "{:<4} {:<40} {:<15} {:<8}",
-                            i + 1,
-                            repo.full_name,
-                            repo.language.as_deref().unwrap_or("N/A"),
-                            repo.stargazers_count
-                        );
-                    }
-                }
-            } else {
-                // Traditional keyword search
-                let cache = load_cache(username)?.ok_or_else(|| {
-                    anyhow!("No cache found for user: {}. Run 'fetch' first.", username)
-                })?;
-
-                let results = search_repos(&cache, language, query);
-                display_repos(&results);
-            }
+            // Combined search using both keyword and semantic approaches
+            let results = search_repos(username, language, query, *limit)?;
+            display_repos(&results);
         }
-        Commands::List { username } => {
-            let cache = load_cache(username)?.ok_or_else(|| {
-                anyhow!("No cache found for user: {}. Run 'fetch' first.", username)
-            })?;
+        Commands::List { username, limit } => {
+            println!(
+                "Listing repositories for user: {} (limit: {})",
+                username, limit
+            );
 
-            let all_repos: Vec<&StarredRepo> = cache.repos.iter().collect();
-            display_repos(&all_repos);
+            // Use the search function with empty query to list repos
+            let results = search_repos(username, &None, "", *limit)?;
+            display_repos(&results);
         }
         Commands::Info { username, number } => {
-            let cache = load_cache(username)?.ok_or_else(|| {
-                anyhow!("No cache found for user: {}. Run 'fetch' first.", username)
-            })?;
+            // Get all repos for the user
+            let repos = search_repos(username, &None, "", std::usize::MAX)?;
 
-            if *number == 0 || *number > cache.repos.len() {
+            if *number == 0 || *number > repos.len() {
                 return Err(anyhow!(
                     "Invalid repository number. Must be between 1 and {}.",
-                    cache.repos.len()
+                    repos.len()
                 ));
             }
 
-            let repo = &cache.repos[*number - 1];
+            let repo = &repos[*number - 1];
             display_repo_info(repo);
         }
     }
