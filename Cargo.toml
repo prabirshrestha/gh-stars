@@ -12,7 +12,7 @@ homepage = "https://github.com/prabirshrestha/gh-stars"
 anyhow = "1.0.98"
 clap = { version = "4.5.36", features = ["derive"] }
 dirs = "6.0.0"
-fastembed = "4.7.0"
+fastembed = { version = "4.7.0", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
 gh-token = "0.1.8"
 indicatif = "0.17.11"
 reqwest = { version = "0.12.15", features = ["json"] }
