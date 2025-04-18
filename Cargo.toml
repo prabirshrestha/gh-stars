@@ -15,7 +15,7 @@ dirs = "6.0.0"
 fastembed = { version = "4.7.0", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
 gh-token = "0.1.8"
 indicatif = "0.17.11"
-reqwest = { version = "0.12.15", features = ["json"] }
+reqwest = { version = "0.12.15", features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.34.0", features = ["bundled", "blob", "array"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
