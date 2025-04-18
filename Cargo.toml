@@ -5,6 +5,8 @@ edition = "2024"
 description = "A CLI tool to fetch, cache, and search GitHub stars with vector search"
 readme = "README.md"
 license = "MIT"
+repository = "https://github.com/prabirshrestha/gh-stars"
+homepage = "https://github.com/prabirshrestha/gh-stars"
 
 [dependencies]
 anyhow = "1.0.98"
@@ -20,3 +22,8 @@ serde_json = "1.0.140"
 sqlite-vec = "0.1.6"
 tokio = { version = "1.44.2", features = ["full"] }
 zerocopy = "0.7.33"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
