@@ -94,11 +94,17 @@ struct StarredRepo {
     created_at: Option<String>,
 }
 
+// Get the cache directory path for the application
+fn get_cache_dir() -> Result<PathBuf> {
+    let mut path = cache_dir().ok_or_else(|| anyhow!("Failed to determine cache directory"))?;
+    path.push("gh-stars");
+    create_dir_all(&path)?;
+    Ok(path)
+}
+
 // Get the path to the SQLite database (one DB for all users)
 fn get_db_path() -> Result<PathBuf> {
-    let mut db_path = cache_dir().ok_or_else(|| anyhow!("Failed to determine cache directory"))?;
-    db_path.push("gh-stars");
-    create_dir_all(&db_path)?;
+    let mut db_path = get_cache_dir()?;
     db_path.push("stars.db");
     Ok(db_path)
 }
@@ -431,10 +437,7 @@ fn store_repos_in_db(username: &str, repos: &[StarredRepo], timestamp: i64) -> R
             .map_err(|e| anyhow!("Embedding failed: {}", e))?;
 
         // Convert f32 vector to bytes for SQLite (safe version)
-        let embedding_bytes: Vec<u8> = embedding[0]
-            .iter()
-            .flat_map(|&f| f.to_le_bytes())
-            .collect();
+        let embedding_bytes: Vec<u8> = embedding[0].iter().flat_map(|&f| f.to_le_bytes()).collect();
 
         // Insert embedding
         tx.execute(
@@ -581,9 +584,15 @@ fn search_repos(
 
     // 2. Vector search if query isn't too short
     if query.len() >= 3 {
-        // Initialize the embedder
-        let embedder = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::AllMiniLML6V2))
-            .map_err(|e| anyhow!("Failed to initialize embedder: {}", e))?;
+        // Initialize the embedder with the same cache dir as the database
+        let cache_dir = get_cache_dir()?;
+
+        let embedder = TextEmbedding::try_new(
+            InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+                .with_show_download_progress(true)
+                .with_cache_dir(cache_dir),
+        )
+        .map_err(|e| anyhow!("Failed to initialize embedder: {}", e))?;
 
         // Generate embedding for the query
         let query_embedding = embedder
