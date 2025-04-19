@@ -95,8 +95,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          target: ${{ matrix.job.target }}
       - name: install rustup targets
-        run: rustup target add ${{ matrix.target }}
+        run: rustup target add ${{ matrix.job.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Install cross
         if: matrix.job.use_cross
