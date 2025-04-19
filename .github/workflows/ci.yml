@@ -112,6 +112,7 @@ jobs:
         run: |
           gcc --version || true
           rustup -V
+          rustup show
           rustup toolchain list
           rustup default
           cargo -V
