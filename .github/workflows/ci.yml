@@ -1,4 +1,4 @@
-name: Cl
+name: CI
 
 on:
   workflow_dispatch:
@@ -46,122 +46,120 @@ jobs:
       maintainer: ${{ steps.crate_metadata.outputs.maintainer }}
       homepage: ${{ steps.crate_metadata.outputs.homepage }}
       msrv: ${{ steps.crate_metadata.outputs.msrv }}
+
   build:
+    name: ${{ matrix.job.os }}-${{ matrix.job.target }}
+    needs: [check, crate_metadata]
+    env:
+      BUILD_CMD: cargo
+      EXTENSION: ""
+      NAME: ${{ needs.crate_metadata.outputs.name }}
+      VERSION: ${{ needs.crate_metadata.outputs.version }}
+    runs-on: ${{ matrix.job.os }}
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-gnu
-          # - x86_64-unknown-linux-musl
-          - x86_64-apple-darwin
-          - aarch64-apple-darwin
-          - x86_64-pc-windows-msvc
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          # - target: x86_64-unknown-linux-musl
-          #   os: ubuntu-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-    runs-on: ${{ matrix.os }}
-    env:
-      # emit backtraces on panics.
-      RUST_BACKTRACE: 1
+        job:
+          - {
+              os: ubuntu-latest,
+              target: x86_64-unknown-linux-gnu,
+              bin_ext: "",
+              archive_ext: ".tar.gz",
+            }
+          # - {
+          #     os: ubuntu-latest,
+          #     target: x86_64-unknown-linux-musl,
+          #     bin_ext: "",
+          #     archive_ext: ".tar.gz",
+          #     use_cross: true,
+          #   }
+          - {
+              os: windows-latest,
+              target: x86_64-pc-windows-msvc,
+              bin_ext: ".exe",
+              archive_ext: ".zip",
+            }
+          - {
+              os: macos-latest,
+              target: x86_64-apple-darwin,
+              bin_ext: "",
+              archive_ext: ".tar.gz",
+            }
+          - {
+              os: macos-latest,
+              target: aarch64-apple-darwin,
+              bin_ext: "",
+              archive_ext: ".tar.gz",
+            }
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-      - name: Get the build metadata
-        shell: bash
-        run: |
-          echo "version=$(grep -m 1 '^version = ' Cargo.toml | cut -f 3 -d ' ' | tr -d \")" >> $GITHUB_ENV
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
+      - name: Checkout
+        uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          target: ${{ matrix.target }}
-          override: true
-          profile: minimal
-          components: rustfmt, clippy
-      - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get install -y musl-tools
-      - uses: swatinem/rust-cache@v2.7.8
-
-      - name: rust fmt
-        uses: actions-rs/cargo@v1
+          target: ${{ matrix.job.target }}
+      - name: Install rustup targets
+        run: rustup target add ${{ matrix.job.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross
+        if: matrix.job.use_cross
+        uses: taiki-e/install-action@v2
         with:
-          command: fmt
-          args: --all -- --check
-      # - name: clippy
-      #   uses: actions-rs/clippy-check@v1
-      #   with:
-      #     token: ${{ secrets.GITHUB_TOKEN }}
-      #     args: --all-features
-
-      - name: Build debug
-        uses: actions-rs/cargo@v1
-        with:
-          use-cross: ${{ matrix.usecross }}
-          command: build
-          args: --verbose --locked --all --target ${{ matrix.target }}
-
-      - name: Build release
-        uses: actions-rs/cargo@v1
-        with:
-          use-cross: ${{ matrix.usecross }}
-          command: build
-          args: --verbose --locked --all --release --target ${{ matrix.target }}
-
-      - name: Prepare unix archive
-        if: matrix.os != 'windows-latest'
-        working-directory: target/${{ matrix.target }}/release
+          tool: cross
+      - name: Overwrite build command env variable
+        if: matrix.job.use_cross
+        shell: bash
+        run: echo "BUILD_CMD=cross" >> $GITHUB_ENV
+      - name: Show version information (Rust, cargo, GCC)
+        shell: bash
         run: |
-          strip gh-stars
-          tar czvf ../../../gh-stars-v${{ env.version }}-${{ matrix.target }}.tar.gz gh-stars
-
-      - name: Prepare windows archive
-        if: matrix.os == 'windows-latest'
-        working-directory: target/${{ matrix.target }}/release
+          gcc --version || true
+          rustup -V
+          rustup show
+          rustup toolchain list
+          rustup default
+          cargo -V
+          rustc -V
+      - name: Set extensions from matrix
+        shell: bash
         run: |
-          strip gh-stars.exe
-          7z a ../../../gh-stars-v${{ env.version }}-${{ matrix.target }}.zip gh-stars.exe
-
-      - name: Upload unix artifact
+          echo "BIN_EXT=${{ matrix.job.bin_ext }}" >> $GITHUB_ENV
+          echo "ARCHIVE_EXT=${{ matrix.job.archive_ext }}" >> $GITHUB_ENV
+      - name: Build on ${{ matrix.job.target }}
+        shell: bash
+        run: $BUILD_CMD build --locked --all --release --target=${{ matrix.job.target }}
+      - name: Prepare archive
+        shell: bash
+        working-directory: target/${{ matrix.job.target }}/release
+        run: |
+          strip ${{ env.NAME }}${{ env.BIN_EXT }}
+          if [[ "${{ matrix.job.os }}" == "windows-latest" ]]; then
+            7z a ../../../${{ env.NAME }}-v${{ env.VERSION }}-${{ matrix.job.target }}${{ env.ARCHIVE_EXT }} ${{ env.NAME }}${{ env.BIN_EXT }}
+          else
+            tar czvf ../../../${{ env.NAME }}-v${{ env.VERSION }}-${{ matrix.job.target }}${{ env.ARCHIVE_EXT }} ${{ env.NAME }}${{ env.BIN_EXT }}
+          fi
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
-        if: matrix.os != 'windows-latest'
         with:
-          name: gh-stars-v${{ env.version }}-${{ matrix.target }}.tar.gz
-          path: gh-stars-v${{ env.version }}-${{ matrix.target }}.tar.gz
-          if-no-files-found: error
-
-      - name: Upload windows artifact
-        uses: actions/upload-artifact@v4
-        if: matrix.os == 'windows-latest'
-        with:
-          name: gh-stars-v${{ env.version }}-${{ matrix.target }}.zip
-          path: gh-stars-v${{ env.version }}-${{ matrix.target }}.zip
+          name: ${{ env.NAME }}-v${{ env.VERSION }}-${{ matrix.job.target }}${{ env.ARCHIVE_EXT }}
+          path: ${{ env.NAME }}-v${{ env.VERSION }}-${{ matrix.job.target }}${{ env.ARCHIVE_EXT }}
           if-no-files-found: error
 
   publish_crate:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/v')
     needs:
       - build
+      - crate_metadata
+    env:
+      NAME: ${{ needs.crate_metadata.outputs.name }}
+      VERSION: ${{ needs.crate_metadata.outputs.version }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Login to crates.io
         uses: actions-rs/cargo@v1
         with:
@@ -176,51 +174,26 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     needs:
       - publish_crate
+      - crate_metadata
+    env:
+      NAME: ${{ needs.crate_metadata.outputs.name }}
+      VERSION: ${{ needs.crate_metadata.outputs.version }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Get the build metadata
-        shell: bash
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+      - name: Move artifacts to root directory
         run: |
-          echo "version=$(grep -m 1 '^version = ' Cargo.toml | cut -f 3 -d ' ' | tr -d \")" >> $GITHUB_ENV
-      - name: Download x86_64-unknown-linux-gnu.tar.gz
-        uses: actions/download-artifact@v4
-        with:
-          name: gh-stars-v${{ env.version }}-x86_64-unknown-linux-gnu.tar.gz
-          path: .
-      # - name: Download x86_64-unknown-linux-musl.tar.gz
-      #   uses: actions/download-artifact@v4
-      #   with:
-      #     name: gh-stars-v${{ env.version }}-x86_64-unknown-linux-musl.tar.gz
-      #     path: .
-      - name: Download gh-stars-x86_64-apple-darwin.tar.gz
-        uses: actions/download-artifact@v4
-        with:
-          name: gh-stars-v${{ env.version }}-x86_64-apple-darwin.tar.gz
-          path: .
-      - name: Download gh-stars-aarch64-apple-darwin.tar.gz
-        uses: actions/download-artifact@v4
-        with:
-          name: gh-stars-v${{ env.version }}-aarch64-apple-darwin.tar.gz
-          path: .
-      - name: gh-stars-x86_64-pc-windows-msvc.zip
-        uses: actions/download-artifact@v4
-        with:
-          name: gh-stars-v${{ env.version }}-x86_64-pc-windows-msvc.zip
-          path: .
+          mv ./artifacts/*/* .
       - name: Generate checksums
-        run: for file in gh-stars-*; do openssl dgst -sha256 -r "$file" | awk '{print $1}' > "${file}.sha256"; done
+        run: for file in ${{ env.NAME }}-*; do openssl dgst -sha256 -r "$file" | awk '{print $1}' > "${file}.sha256"; done
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            gh-stars-v${{ env.version }}-x86_64-unknown-linux-gnu.tar.gz
-            gh-stars-v${{ env.version }}-x86_64-unknown-linux-gnu.tar.gz.sha256
-            gh-stars-v${{ env.version }}-x86_64-apple-darwin.tar.gz
-            gh-stars-v${{ env.version }}-x86_64-apple-darwin.tar.gz.sha256
-            gh-stars-v${{ env.version }}-aarch64-apple-darwin.tar.gz
-            gh-stars-v${{ env.version }}-aarch64-apple-darwin.tar.gz.sha256
-            gh-stars-v${{ env.version }}-x86_64-pc-windows-msvc.zip
-            gh-stars-v${{ env.version }}-x86_64-pc-windows-msvc.zip.sha256
+            ${{ env.NAME }}-*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,5 +1,6 @@
 [package]
 name = "gh-stars"
+authors = ["Prabir Shrestha <mail@prabir.me>"]
 version = "0.1.6"
 edition = "2024"
 description = "A CLI tool to fetch, cache, and search GitHub stars with vector search"
