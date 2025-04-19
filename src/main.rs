@@ -10,7 +10,6 @@ use sqlite_vec::sqlite3_vec_init;
 use std::fs::create_dir_all;
 use std::path::PathBuf;
 use std::time::SystemTime;
-use zerocopy::AsBytes;
 
 #[derive(Parser)]
 #[command(
@@ -431,8 +430,13 @@ fn store_repos_in_db(username: &str, repos: &[StarredRepo], timestamp: i64) -> R
             .embed(vec![embed_text], None)
             .map_err(|e| anyhow!("Embedding failed: {}", e))?;
 
+        // Convert f32 vector to bytes for SQLite (safe version)
+        let embedding_bytes: Vec<u8> = embedding[0]
+            .iter()
+            .flat_map(|&f| f.to_le_bytes())
+            .collect();
+
         // Insert embedding
-        let embedding_bytes = embedding[0].as_bytes();
         tx.execute(
             "INSERT INTO repo_vectors(rowid, embedding) VALUES (?, ?)",
             params![repo.id, embedding_bytes],
@@ -586,8 +590,11 @@ fn search_repos(
             .embed(vec![query.to_string()], None)
             .map_err(|e| anyhow!("Embedding query failed: {}", e))?;
 
-        // Convert the embedding to bytes
-        let query_embedding_bytes = query_embedding[0].as_bytes().to_vec();
+        // Convert f32 vector to bytes for SQLite (safe version)
+        let query_embedding_bytes: Vec<u8> = query_embedding[0]
+            .iter()
+            .flat_map(|&f| f.to_le_bytes())
+            .collect();
 
         // Build the vector search query
         let vector_sql = format!(
