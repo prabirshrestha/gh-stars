@@ -10,6 +10,7 @@ A command-line tool to fetch, cache, and search GitHub stars for any user, with 
 - Multi-language filtering support
 - View detailed information about specific repositories
 - GitHub API authentication support to avoid rate limits
+- Search across multiple users' starred repositories
 
 ## Installation
 1. Make sure you have Rust and Cargo installed
@@ -64,29 +65,45 @@ gh-stars fetch <username> --token your_github_token_here
 
 ### List all starred repositories
 ```bash
-gh-stars list <username>
+# List for specific user(s)
+gh-stars list --username=<username>
+
+# List for multiple users
+gh-stars list --username=user1,user2,user3
+
+# List all cached users' stars (if no username specified)
+gh-stars list
+
+# Limit results
+gh-stars list --username=<username> --limit 100
 ```
 
 ### Search repositories
 ```bash
-# Basic keyword search
-gh-stars search <username> "search query"
+# Basic keyword search for specific user(s)
+gh-stars search --username=<username> search query
+
+# Search across multiple users
+gh-stars search --username=user1,user2,user3 search query
+
+# Search across all cached users (if no username specified)
+gh-stars search search query
 
 # Search with language filtering
-gh-stars search <username> --language=rust,go "search query"
+gh-stars search --username=<username> --language=rust,go search query
 
-# Semantic vector search
-gh-stars search <username> --semantic "modern web framework with state management"
+# Limit search results
+gh-stars search --username=<username> --limit 100 search query
 
-# Combine language filtering with semantic search
-gh-stars search <username> --language=rust --semantic "async runtime"
+# Multi-word search terms don't need quotes anymore
+gh-stars search chat gpt
 ```
 
 ### View repository details
 ```bash
-gh-stars info <username> <number>
+gh-stars info user/repo
 ```
-The `<number>` is the repository number shown in the list/search results.
+Use the format `user/repo` such as `octocat/Hello-World`.
 
 ## Examples
 ```bash
@@ -96,23 +113,29 @@ gh-stars fetch octocat
 # Fetch with authentication to avoid rate limits
 gh-stars fetch octocat --token your_github_token_here
 
-# List all stars
-gh-stars list octocat
+# List all stars for octocat
+gh-stars list --username=octocat
+
+# List stars for multiple users
+gh-stars list --username=octocat,rust-lang
+
+# List stars from all cached users
+gh-stars list
+
+# Search across all octocat's stars
+gh-stars search --username=octocat web framework
+
+# Search across multiple users' stars
+gh-stars search --username=octocat,rust-lang web framework
+
+# Search all cached users' stars
+gh-stars search web framework
 
 # Search for Rust or Go projects
-gh-stars search octocat --language=rust,go
+gh-stars search --username=octocat --language=rust,go
 
-# Full text search
-gh-stars search octocat "web framework"
-
-# Semantic vector search for projects similar to the concept
-gh-stars search octocat --semantic "modern web framework with state management"
-
-# Filter Rust projects and use semantic search
-gh-stars search octocat --language=rust --semantic "async runtime"
-
-# View details for the first repository in the list
-gh-stars info octocat 1
+# View details for a specific repository
+gh-stars info octocat/Hello-World
 ```
 
 ## Cache Location

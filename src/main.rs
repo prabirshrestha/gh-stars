@@ -2,7 +2,6 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use dirs::cache_dir;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
-use gh_token;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, LINK, USER_AGENT};
 use rusqlite::{Connection, ffi::sqlite3_auto_extension, params};
@@ -41,16 +40,17 @@ enum Commands {
     },
     /// Search cached stars
     Search {
-        /// GitHub username whose stars to search
-        username: String,
+        /// GitHub username(s) whose stars to search (comma separated)
+        #[arg(short, long, value_parser = parse_usernames)]
+        username: Option<Vec<String>>,
 
         /// Programming language(s) to filter by (comma separated)
         #[arg(long, value_parser = parse_languages)]
         language: Option<Vec<String>>,
 
-        /// Search text (searches across name, description, and other fields)
-        #[arg(default_value = "")]
-        query: String,
+        /// Search terms (searches across name, description, and other fields)
+        #[arg(trailing_var_arg = true)]
+        terms: Vec<String>,
 
         /// Maximum number of results to return
         #[arg(short, long, default_value = "30")]
@@ -58,8 +58,9 @@ enum Commands {
     },
     /// List all cached stars for a user
     List {
-        /// GitHub username
-        username: String,
+        /// GitHub username(s) whose stars to list (comma separated)
+        #[arg(short, long, value_parser = parse_usernames)]
+        username: Option<Vec<String>>,
 
         /// Maximum number of results to return
         #[arg(short, long, default_value = "30")]
@@ -67,11 +68,8 @@ enum Commands {
     },
     /// Show detailed information about a specific repository
     Info {
-        /// GitHub username
-        username: String,
-
-        /// Repository number from list/search results
-        number: usize,
+        /// Repository in format user/repo
+        repo: String,
     },
 }
 
@@ -168,10 +166,7 @@ fn get_github_token(cli_token: &Option<String>) -> Option<String> {
     }
 
     // Otherwise try to get token from gh_token crate
-    match gh_token::get() {
-        Ok(token) => Some(token),
-        Err(_) => None,
-    }
+    gh_token::get().ok()
 }
 
 async fn fetch_stars(
@@ -338,6 +333,14 @@ fn parse_languages(s: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+// Helper function to parse comma-separated usernames
+fn parse_usernames(s: &str) -> Result<Vec<String>> {
+    Ok(s.split(',')
+        .map(|username| username.trim().to_string())
+        .filter(|username| !username.is_empty())
+        .collect())
+}
+
 // Store repositories and their embeddings in the database
 fn store_repos_in_db(username: &str, repos: &[StarredRepo], timestamp: i64) -> Result<()> {
     // Create a progress bar for the embedding process
@@ -361,25 +364,23 @@ fn store_repos_in_db(username: &str, repos: &[StarredRepo], timestamp: i64) -> R
         params![username, timestamp],
     )?;
 
+    // Get all repo IDs for this user before deleting repos
+    let repo_ids: Vec<i64> = {
+        let mut stmt = tx.prepare("SELECT id FROM repos WHERE username = ?")?;
+        stmt.query_map(params![username], |row| row.get(0))?
+            .collect::<Result<Vec<i64>, _>>()?
+    };
+
     // Clear existing data for this user
     tx.execute("DELETE FROM repos WHERE username = ?", params![username])?;
 
     // Clear existing vectors for this user's repos
-    {
-        // Create a scope to ensure stmt is dropped before tx.commit()
-        // First, get all repo IDs for this user
-        let mut stmt = tx.prepare("SELECT id FROM repos WHERE username = ?")?;
-        let repo_ids: Vec<i64> = stmt
-            .query_map(params![username], |row| row.get(0))?
-            .collect::<Result<Vec<i64>, _>>()?;
-
-        if !repo_ids.is_empty() {
-            // For each ID, delete the corresponding vector
-            for id in repo_ids {
-                tx.execute("DELETE FROM repo_vectors WHERE rowid = ?", params![id])?;
-            }
+    if !repo_ids.is_empty() {
+        // For each ID, delete the corresponding vector
+        for id in repo_ids {
+            tx.execute("DELETE FROM repo_vectors WHERE rowid = ?", params![id])?;
         }
-    } // stmt is dropped here
+    }
 
     // Initialize the embedder
     let embedder = TextEmbedding::try_new(
@@ -523,16 +524,15 @@ fn search_repos(
         language_filter, limit
     );
 
-    // Build parameters for query without cloning
-    let mut keyword_params: Vec<&dyn rusqlite::ToSql> = Vec::new();
-
-    // Add the LIKE parameters
-    keyword_params.push(&query_lower as &dyn rusqlite::ToSql);
-    keyword_params.push(&query_lower as &dyn rusqlite::ToSql);
-    keyword_params.push(&query_lower as &dyn rusqlite::ToSql);
-
-    // Add username
-    keyword_params.push(&username as &dyn rusqlite::ToSql);
+    // Build parameters for query using vec macro
+    let mut keyword_params: Vec<&dyn rusqlite::ToSql> = vec![
+        // Add the LIKE parameters
+        &query_lower as &dyn rusqlite::ToSql,
+        &query_lower as &dyn rusqlite::ToSql,
+        &query_lower as &dyn rusqlite::ToSql,
+        // Add username
+        &username as &dyn rusqlite::ToSql,
+    ];
 
     // Add language parameters
     if let Some(langs) = languages {
@@ -701,7 +701,7 @@ fn display_repos(repos: &[StarredRepo]) {
         );
     }
 
-    println!("\nUse 'gh-stars info <username> <number>' to see more details about a repository.");
+    println!("\nUse 'gh-stars info user/repo' to see more details about a repository.");
 }
 
 fn display_repo_info(repo: &StarredRepo) {
@@ -734,7 +734,14 @@ fn display_repo_info(repo: &StarredRepo) {
 #[tokio::main]
 async fn main() -> Result<()> {
     unsafe {
-        sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
+        sqlite3_auto_extension(Some(std::mem::transmute::<
+            *const (),
+            unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *mut i8,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> i32,
+        >(sqlite3_vec_init as *const ())));
     }
 
     let cli = Cli::parse();
@@ -750,41 +757,155 @@ async fn main() -> Result<()> {
         Commands::Search {
             username,
             language,
-            query,
+            terms,
             limit,
         } => {
+            // Join all search terms into a single query string, or use empty string if no terms provided
+            let query = if terms.is_empty() {
+                String::new()
+            } else {
+                terms.join(" ")
+            };
+            let usernames = match username {
+                Some(users) => users.clone(),
+                None => {
+                    // If no username is provided, get all cached users
+                    let conn = init_db()?;
+                    let mut stmt = conn.prepare("SELECT username FROM users")?;
+                    let users_iter = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                    let mut users = Vec::new();
+                    for user in users_iter {
+                        users.push(user?);
+                    }
+
+                    if users.is_empty() {
+                        return Err(anyhow!(
+                            "No cached users found. Fetch stars for a user first using the fetch command."
+                        ));
+                    }
+                    users
+                }
+            };
+
             println!(
-                "Searching repositories for user: {} (limit: {})",
-                username, limit
+                "Searching repositories for user(s): {} (limit: {})",
+                usernames.join(", "),
+                limit
             );
 
-            // Combined search using both keyword and semantic approaches
-            let results = search_repos(username, language, query, *limit)?;
-            display_repos(&results);
+            let mut all_results = Vec::new();
+            for username in &usernames {
+                let results = search_repos(username, language, &query, *limit)?;
+                all_results.extend(results);
+            }
+
+            // Sort by stars and limit to the requested number
+            all_results.sort_by(|a, b| b.stargazers_count.cmp(&a.stargazers_count));
+            let limited_results = all_results.into_iter().take(*limit).collect::<Vec<_>>();
+
+            display_repos(&limited_results);
         }
         Commands::List { username, limit } => {
+            let usernames = match username {
+                Some(users) => users.clone(),
+                None => {
+                    // If no username is provided, get all cached users
+                    let conn = init_db()?;
+                    let mut stmt = conn.prepare("SELECT username FROM users")?;
+                    let users_iter = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                    let mut users = Vec::new();
+                    for user in users_iter {
+                        users.push(user?);
+                    }
+
+                    if users.is_empty() {
+                        return Err(anyhow!(
+                            "No cached users found. Fetch stars for a user first using the fetch command."
+                        ));
+                    }
+                    users
+                }
+            };
+
             println!(
-                "Listing repositories for user: {} (limit: {})",
-                username, limit
+                "Listing repositories for user(s): {} (limit: {})",
+                usernames.join(", "),
+                limit
             );
 
-            // Use the search function with empty query to list repos
-            let results = search_repos(username, &None, "", *limit)?;
-            display_repos(&results);
-        }
-        Commands::Info { username, number } => {
-            // Get all repos for the user
-            let repos = search_repos(username, &None, "", std::usize::MAX)?;
+            let mut all_results = Vec::new();
+            for username in &usernames {
+                // Use the search function with empty query to list repos
+                let results = search_repos(username, &None, "", *limit)?;
+                all_results.extend(results);
+            }
 
-            if *number == 0 || *number > repos.len() {
+            // Sort by stars and limit to the requested number
+            all_results.sort_by(|a, b| b.stargazers_count.cmp(&a.stargazers_count));
+            let limited_results = all_results.into_iter().take(*limit).collect::<Vec<_>>();
+
+            display_repos(&limited_results);
+        }
+        Commands::Info { repo } => {
+            // Parse the repo string in format "user/repo"
+            let parts: Vec<&str> = repo.split('/').collect();
+            if parts.len() != 2 {
                 return Err(anyhow!(
-                    "Invalid repository number. Must be between 1 and {}.",
-                    repos.len()
+                    "Invalid repository format. Expected format: user/repo"
                 ));
             }
 
-            let repo = &repos[*number - 1];
-            display_repo_info(repo);
+            let username = parts[0];
+            let repo_name = parts[1];
+
+            // Open database connection
+            let conn = init_db()?;
+
+            // Try to find the repository by full_name first (this is what's displayed in the list)
+            let query = "SELECT json FROM repos WHERE full_name = ?";
+            match conn.query_row(query, params![repo], |row| {
+                let json: String = row.get(0)?;
+                let repo: StarredRepo = serde_json::from_str(&json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                Ok(repo)
+            }) {
+                Ok(repo) => {
+                    display_repo_info(&repo);
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    // If not found by full_name, try with username and name
+                    let fallback_query = "SELECT json FROM repos WHERE username = ? AND name = ?";
+                    match conn.query_row(fallback_query, params![username, repo_name], |row| {
+                        let json: String = row.get(0)?;
+                        let repo: StarredRepo = serde_json::from_str(&json).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
+                        Ok(repo)
+                    }) {
+                        Ok(repo) => {
+                            display_repo_info(&repo);
+                        }
+                        Err(rusqlite::Error::QueryReturnedNoRows) => {
+                            return Err(anyhow!("Repository {} not found in cache", repo));
+                        }
+                        Err(e) => {
+                            return Err(anyhow!("Database error: {}", e));
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(anyhow!("Database error: {}", e));
+                }
+            }
         }
     }
 
