@@ -66,13 +66,13 @@ jobs:
               bin_ext: "",
               archive_ext: ".tar.gz",
             }
-          - {
-              os: ubuntu-latest,
-              target: x86_64-unknown-linux-musl,
-              bin_ext: "",
-              archive_ext: ".tar.gz",
-              use_cross: true,
-            }
+          # - {
+          #     os: ubuntu-latest,
+          #     target: x86_64-unknown-linux-musl,
+          #     bin_ext: "",
+          #     archive_ext: ".tar.gz",
+          #     use_cross: true,
+          #   }
           - {
               os: windows-latest,
               target: x86_64-pc-windows-msvc,
