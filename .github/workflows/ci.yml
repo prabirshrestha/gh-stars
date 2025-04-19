@@ -95,9 +95,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-          targets: aarch64-apple-darwin, x86_64-apple-darwin, aarch64-unknown-linux-gnu x86_64-pc-windows-msvc
+      - name: install rustup targets
+        run: rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Install cross
         if: matrix.job.use_cross
