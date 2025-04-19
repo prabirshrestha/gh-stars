@@ -20,16 +20,6 @@ A command-line tool to fetch, cache, and search GitHub stars for any user, with 
 cargo install --path .
 ```
 
-### Vector Search Requirements
-For semantic vector search functionality, you need:
-1. Install the sqlite-vec extension (https://github.com/asg017/sqlite-vec)
-2. Make sure rusqlite is compiled with the `loadable_extension` feature:
-   ```toml
-   # In Cargo.toml
-   rusqlite = { version = "0.34", features = ["bundled", "loadable_extension"] }
-   ```
-3. Uncomment the extension loading code in the `init_db` function
-
 ## Authentication
 The tool supports GitHub API authentication to avoid rate limits:
 
@@ -144,10 +134,6 @@ Stars are cached in your system's cache directory:
 - **macOS**: `~/Library/Caches/gh-stars/`
 - **Windows**: `C:\Users\<username>\AppData\Local\Cache\gh-stars\`
 
-Two cache formats are used:
-1. JSON file: `<username>.json` - For regular keyword search
-2. SQLite database: `<username>.db` - For semantic vector search with embeddings
-
 ## How It Works
 The tool uses:
 - GitHub's REST API to fetch starred repositories
@@ -159,9 +145,6 @@ The tool uses:
 ### Search Types
 1. **Keyword Search**: Performs traditional text matching on repository names, descriptions, and other metadata.
 2. **Semantic Search**: Uses text embeddings to find repositories that are conceptually similar to your query, even if they don't contain the exact keywords.
-
-## Rate Limits
-Without authentication, GitHub API limits requests to 60 per hour per IP address. With authentication, this increases to 5,000 requests per hour. For users with many starred repositories, authentication is recommended to avoid hitting rate limits.
 
 ## Troubleshooting
 If you encounter issues with vector search:
