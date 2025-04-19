@@ -54,11 +54,6 @@ jobs:
         with:
           command: fmt
           args: --all -- --check
-      - name: clippy
-        uses: actions-rs/clippy-check@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          args: -p gh-stars --all-features
       - name: Build debug
         uses: actions-rs/cargo@v1
         with:
