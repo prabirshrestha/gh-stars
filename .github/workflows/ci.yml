@@ -195,7 +195,7 @@ jobs:
       - name: Generate checksums
         run: for file in ${{ env.NAME }}-*; do openssl dgst -sha256 -r "$file" | awk '{print $1}' > "${file}.sha256"; done
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             ${{ env.NAME }}-*
