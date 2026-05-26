@@ -143,7 +143,7 @@ jobs:
             tar czvf ../../../${{ env.NAME }}-v${{ env.VERSION }}-${{ matrix.job.target }}${{ env.ARCHIVE_EXT }} ${{ env.NAME }}${{ env.BIN_EXT }}
           fi
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.NAME }}-v${{ env.VERSION }}-${{ matrix.job.target }}${{ env.ARCHIVE_EXT }}
           path: ${{ env.NAME }}-v${{ env.VERSION }}-${{ matrix.job.target }}${{ env.ARCHIVE_EXT }}
@@ -186,7 +186,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ./artifacts
       - name: Move artifacts to root directory
