@@ -109,6 +109,14 @@ fn get_db_path() -> Result<PathBuf> {
     Ok(db_path)
 }
 
+fn u64_to_sqlite(value: u64, field: &str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| anyhow!("{} value {} exceeds SQLite INTEGER range", field, value))
+}
+
+fn optional_u64_to_sqlite(value: Option<u64>, field: &str) -> Result<Option<i64>> {
+    value.map(|value| u64_to_sqlite(value, field)).transpose()
+}
+
 // Initialize SQLite database with vector extension
 fn init_db() -> Result<Connection> {
     let db_path = get_db_path()?;
@@ -406,7 +414,7 @@ fn store_repos_in_db(username: &str, repos: &[StarredRepo], timestamp: i64) -> R
             (id, username, full_name, name, owner, html_url, description, language, stars, forks, open_issues, updated_at, created_at, json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
-                repo.id,
+                u64_to_sqlite(repo.id, "repo.id")?,
                 username,
                 repo.full_name,
                 repo.name,
@@ -414,9 +422,9 @@ fn store_repos_in_db(username: &str, repos: &[StarredRepo], timestamp: i64) -> R
                 repo.html_url,
                 repo.description,
                 repo.language,
-                repo.stargazers_count,
-                repo.forks_count,
-                repo.open_issues_count,
+                u64_to_sqlite(repo.stargazers_count, "repo.stargazers_count")?,
+                optional_u64_to_sqlite(repo.forks_count, "repo.forks_count")?,
+                optional_u64_to_sqlite(repo.open_issues_count, "repo.open_issues_count")?,
                 repo.updated_at,
                 repo.created_at,
                 serde_json::to_string(repo)?
