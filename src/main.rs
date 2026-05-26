@@ -450,7 +450,7 @@ fn store_repos_in_db(username: &str, repos: &[StarredRepo], timestamp: i64) -> R
         // Insert embedding
         tx.execute(
             "INSERT INTO repo_vectors(rowid, embedding) VALUES (?, ?)",
-            params![repo.id, embedding_bytes],
+            params![u64_to_sqlite(repo.id, "repo.id")?, embedding_bytes],
         )?;
     }
 
