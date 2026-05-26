@@ -396,7 +396,7 @@ fn store_repos_in_db(username: &str, repos: &[StarredRepo], timestamp: i64) -> R
     }
 
     // Initialize the embedder
-    let embedder = TextEmbedding::try_new(
+    let mut embedder = TextEmbedding::try_new(
         InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true),
     )
     .map_err(|e| anyhow!("Failed to initialize embedder: {}", e))?;
@@ -595,7 +595,7 @@ fn search_repos(
         // Initialize the embedder with the same cache dir as the database
         let cache_dir = get_cache_dir()?;
 
-        let embedder = TextEmbedding::try_new(
+        let mut embedder = TextEmbedding::try_new(
             InitOptions::new(EmbeddingModel::AllMiniLML6V2)
                 .with_show_download_progress(true)
                 .with_cache_dir(cache_dir),
